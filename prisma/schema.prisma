@@ -1,0 +1,134 @@
+// CarePoint Clinic — Prisma schema
+//
+// Portability rules (so the exact same schema runs on SQLite for local
+// development and on PostgreSQL — e.g. Neon — in production):
+//   * role and status are plain String columns (no native DB enums),
+//   * money is stored as integer cents (no Decimal type),
+//   * no provider-specific column types or features are used.
+// All DateTime values are stored as UTC instants. Clinic-local wall-clock
+// math is done in application code (see src/lib/time.ts and
+// src/server/services/slots.ts) using the CLINIC_TIMEZONE setting.
+//
+// To deploy on PostgreSQL, change ONLY the provider below to
+// "postgresql" and point DATABASE_URL at your Neon connection string:
+//   datasource db { provider = "postgresql" ... }
+// then run `npx prisma db push`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// Accounts. `role` is one of "ADMIN" | "STAFF" | "CUSTOMER" (see src/lib/constants.ts).
+model User {
+  id           String        @id @default(cuid())
+  name         String
+  email        String        @unique
+  passwordHash String
+  role         String
+  createdAt    DateTime      @default(now())
+
+  staff        Staff?
+  // History is never hard-deleted, so appointments reference users with
+  // the default restrict behaviour instead of a cascade.
+  appointments Appointment[] @relation("CustomerAppointments")
+}
+
+/// Bookable clinic services.
+model Service {
+  id              String          @id @default(cuid())
+  name            String          @unique
+  /// Appointment length in minutes.
+  durationMinutes Int
+  /// Price in integer cents (e.g. 50000 = 500 ETB) — exact and portable.
+  priceCents      Int
+  /// Soft-disable instead of delete so past appointments keep their reference.
+  active          Boolean         @default(true)
+  createdAt       DateTime        @default(now())
+
+  staffServices   StaffService[]
+  appointments    Appointment[]
+}
+
+/// Doctor profile (1:1 with a User whose role is "STAFF").
+model Staff {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  specialty String
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  staffServices StaffService[]
+  workingHours  WorkingHours[]
+  timeOff       TimeOff[]
+  appointments  Appointment[]
+}
+
+/// Which doctor offers which service.
+model StaffService {
+  staffId   String
+  serviceId String
+
+  staff   Staff   @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([staffId, serviceId])
+}
+
+/// Weekly working template. `weekday` is 0 = Sunday … 6 = Saturday
+/// (matching Date#getUTCDay / date-fns getDay).
+/// Times are minutes since clinic-local midnight, e.g. 09:30 = 570.
+/// A doctor may have several windows on the same day (morning + afternoon).
+model WorkingHours {
+  id           String @id @default(cuid())
+  staffId      String
+  weekday      Int
+  startMinutes Int
+  endMinutes   Int
+
+  staff Staff @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([staffId, weekday])
+}
+
+/// Holidays / leave, stored as UTC instants.
+model TimeOff {
+  id       String   @id @default(cuid())
+  staffId  String
+  startsAt DateTime
+  endsAt   DateTime
+  reason   String   @default("")
+  staff    Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([staffId, startsAt])
+}
+
+/// Appointments. `status` is one of "BOOKED" | "CANCELLED" | "COMPLETED" |
+/// "NO_SHOW" (see src/lib/constants.ts). Rows are never deleted — cancelling
+/// only flips the status, so history is preserved.
+model Appointment {
+  id             String    @id @default(cuid())
+  customerId     String
+  staffId        String
+  serviceId      String
+  /// UTC start instant.
+  startsAt       DateTime
+  /// UTC end instant (startsAt + service duration at booking time).
+  endsAt         DateTime
+  status         String    @default("BOOKED")
+  notes          String    @default("")
+  /// Set by the reminder cron once the 24h reminder email has been sent.
+  reminderSentAt DateTime?
+  createdAt      DateTime  @default(now())
+
+  customer User    @relation("CustomerAppointments", fields: [customerId], references: [id])
+  staff    Staff   @relation(fields: [staffId], references: [id])
+  service Service @relation(fields: [serviceId], references: [id])
+
+  @@index([staffId, startsAt])
+  @@index([customerId, startsAt])
+  @@index([status])
+}
